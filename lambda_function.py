@@ -5,22 +5,18 @@ import unicodedata
 from datetime import datetime
 import requests
 import traceback
-import re
 from pinecone import Pinecone
 
-MAX_PINECONE_RESULTS = 50
+MAX_PINECONE_RESULTS = 40
 
 def get_secrets():
     try:
         secrets_client = boto3.client('secretsmanager')
-        secret_value = secrets_client.get_secret_value(SecretId="prod")
+        secret_value = secrets_client.get_secret_value(SecretId="prod/pine")
         secrets = json.loads(secret_value['SecretString'])
         return secrets
     except Exception as e:
         raise
-
-def normalize_text(text):
-    return unicodedata.normalize('NFKD', text).encode('utf-8', 'ignore').decode('utf-8').upper()
 
 def get_openai_embedding(input_text, secrets):
     """Obtiene embedding de OpenAI usando requests, modelo text-embedding-3-large."""
@@ -50,6 +46,7 @@ def search_pinecone(query_text, secrets):
         pc = Pinecone(api_key=secrets["PINECONE_API_KEY"])
         index = pc.Index(index_name)
 
+        # Convertir el texto a mayúsculas antes de obtener el embedding
         embedding = get_openai_embedding(query_text, secrets)
 
         pinecone_response = index.query(
@@ -60,13 +57,14 @@ def search_pinecone(query_text, secrets):
 
         candidates = []
         for match in pinecone_response.matches:
-            codigo = str(match.id).upper()
+            codigo = str(match.id)
             desc = str(match.metadata.get("desc", ""))
             candidates.append({"codigo": codigo, "desc": desc})
 
         return candidates
     except Exception as e:
         raise
+
 
 def get_cie10_descriptions(codes):
     """
@@ -91,25 +89,29 @@ def get_cie10_descriptions(codes):
             enriched.append({"codigo": code, "desc": desc})
     return enriched
 
-def extract_client_ip(event):
-    """
-    Extrae la IP del cliente desde el evento de API Gateway (HTTP REST).
-    Método moderno y sencillo.
-    """
-    # API Gateway HTTP REST: IP se suele encontrar en headers bajo X-Forwarded-For
-    headers = event.get("headers", {})
-    x_forwarded_for = headers.get("X-Forwarded-For") or headers.get("x-forwarded-for")
-    if x_forwarded_for:
-        # Puede ser lista: "client-ip, proxy1, proxy2"
-        return x_forwarded_for.split(",")[0].strip()
-    # Fallback: busca en requestContext (aunque HTTP REST no siempre lo tiene)
-    request_context = event.get("requestContext", {})
-    identity = request_context.get("identity", {})
-    ip = identity.get("sourceIp")
-    if ip:
-        return ip
-    # Último recurso: no encontrada
-    return None
+def get_client_ip(event):
+    # Primero intenta 'X-Forwarded-For' del API Gateway, luego 'requestContext', luego headers comunes
+    ip = None
+    # AWS API Gateway v2 (HTTP API)
+    if "requestContext" in event:
+        rc = event["requestContext"]
+        # Websocket
+        ip = rc.get("identity", {}).get("sourceIp")
+        # REST API
+        if not ip:
+            ip = rc.get("http", {}).get("sourceIp")
+    # X-Forwarded-For header
+    if not ip and "headers" in event:
+        xff = event["headers"].get("X-Forwarded-For") or event["headers"].get("x-forwarded-for")
+        if xff:
+            ip = xff.split(",")[0].strip()
+    # Direct sourceIp
+    if not ip:
+        ip = event.get("sourceIp")
+    # Fallback
+    if not ip:
+        ip = "unknown"
+    return ip
 
 def lambda_handler(event, context):
     try:
@@ -123,50 +125,50 @@ def lambda_handler(event, context):
             sessionId = str(uuid.uuid4())
 
         trimmed_texto = texto[:150]
-        normalized_texto = normalize_text(trimmed_texto)
 
-        pinecone_results = search_pinecone(normalized_texto, secrets)
+        pinecone_results = search_pinecone(trimmed_texto, secrets)
         pinecone_results = pinecone_results[:MAX_PINECONE_RESULTS]
-        
-        # Formato compacto para GPT
-        candidatos_gpt_json = [
-            {"codigo": str(r.get("codigo", "")), "desc": str(r.get("desc", "")).upper()}
+
+        candidatos_pinecone = [
+            {"codigo": r.get("codigo", ""), "desc": r.get("desc", "")}
             for r in pinecone_results
         ]
-        valid_codes = set(str(r.get("codigo", "")) for r in pinecone_results)
 
-        reglas_json = [
-            "Si el texto no es clínico, responde [].",
-            "Elige hasta 8 códigos más relevantes.",
-            "Solo puedes elegir códigos de la lista.",
-            "Prefiere lateralidad derecha si no se indica.",
-            "Prefiere fracturas cerradas si no se especifica.",
-            "Responde solo con un array JSON de códigos.",
-            "Ordena los códigos por relevancia."
-        ]
+        # ... (resto del código sin cambios previos)
 
-        # Mensaje para GPT
+        # Llamada a GPT-3.5 Turbo para seleccionar SOLO CÓDIGOS (no objetos)
         gpt_api_url = "https://api.openai.com/v1/chat/completions"
         gpt_headers = {
             "Authorization": f"Bearer {secrets['OPENAI_API_KEY']}",
             "Content-Type": "application/json"
         }
 
-        gpt_prompt_json = {
-            "system": "Eres un codificador experto en CIE-10. Aplica las reglas y responde exclusivamente con los códigos más relevantes en formato JSON.",
-            "texto": trimmed_texto.upper(),
-            "candidatos": candidatos_gpt_json,
-            "reglas": reglas_json
-        }
+        pinecone_json = json.dumps([
+            {"codigo": str(r.get("codigo", "")), "desc": str(r.get("desc", ""))}
+            for r in pinecone_results
+        ], ensure_ascii=False)
+        valid_codes = set(str(r.get("codigo", "")) for r in pinecone_results)
 
+        reglas_json = json.dumps({
+            "instrucciones": [
+                "No generes respuesta si la frase no es coherente en un entorno cínico",
+                "Selecciona 8 códigos con mayor relevancia, solo escoge códigos de la lista de candidatos que se te ofrece",
+                "En códigos con lateralidad, si el texto no lo indica, elige lateralidad derecha",
+                "En códigos  de fractura, si el texto no lo indica, elige primero  fracturas cerradas sobre abiertas.", 
+                "Responde solo un array JSON con los 8 códigos más relevantes, solo array de strings."
+            ]
+        }, ensure_ascii=False)
+
+        # CAMBIO: Enviamos el texto trimado (sin normalizar) a GPT
         messages = [
-            {"role": "system", "content": gpt_prompt_json["system"]},
-            {"role": "user", "content": json.dumps({k: v for k, v in gpt_prompt_json.items() if k != "system"}, ensure_ascii=False)}
+            {"role": "system", "content": "Eres un asistente experto en codificación CIE-10."},
+            {"role": "user", "content": f"Texto: {trimmed_texto}\nCandidatos: {pinecone_json}\nReglas: {reglas_json}\nResponde solo un array JSON con los 8 códigos más relevantes."}
         ]
+
         gpt_data = {
-            "model": "gpt-4o",
+            "model": "gpt-3.5-turbo",  # <-- CAMBIO PRINCIPAL AQUÍ
             "messages": messages,
-            "max_tokens": 50,
+            "max_tokens": 200,
             "temperature": 0.2
         }
 
@@ -176,12 +178,13 @@ def lambda_handler(event, context):
         try:
             response_gpt = requests.post(gpt_api_url, headers=gpt_headers, json=gpt_data)
             if response_gpt.status_code == 200:
-                gpt_response = response_gpt.json()
-                gpt_response_text = gpt_response["choices"][0]["message"]["content"]
+                gpt_json = response_gpt.json()
+                gpt_response_text = gpt_json["choices"][0]["message"]["content"]
                 # Intenta parsear como lista JSON
                 try:
                     codigos_gpt_raw = json.loads(gpt_response_text)
                 except Exception:
+                    import re
                     match = re.search(r'(\[.*\])', gpt_response_text, re.DOTALL)
                     if match:
                         codigos_gpt_raw = json.loads(match.group(1))
@@ -189,34 +192,33 @@ def lambda_handler(event, context):
                         codigos_gpt_raw = []
                 if isinstance(codigos_gpt_raw, list):
                     codigos_gpt = [str(c) for c in codigos_gpt_raw if str(c) in valid_codes]
-                # Tokens usados (requiere que OpenAI devuelva usage)
-                usage = gpt_response.get("usage", {})
+                # Guardamos los tokens si están disponibles
+                usage = gpt_json.get("usage", {})
                 tokens_entrada = usage.get("prompt_tokens", 0)
                 tokens_salida = usage.get("completion_tokens", 0)
         except Exception as e:
             print("Error procesando respuesta de GPT:", str(e))
             codigos_gpt = []
-            tokens_entrada = 0
-            tokens_salida = 0
 
         candidatos_gpt = get_cie10_descriptions(codigos_gpt)
-        ip_cliente = extract_client_ip(event)
 
+        # Obtener IP cliente moderna
+        ip_cliente = get_client_ip(event)
+
+        # Guardar en DynamoDB
         dynamodb = boto3.resource('dynamodb')
         table = dynamodb.Table("sesiones")
         table.put_item(
             Item={
                 "sessionId": sessionId,
                 "texto": trimmed_texto,  # texto literal del usuario, recortado a 200 caracteres
-                "pinecone_results": [
-                    {"codigo": r.get("codigo", ""), "desc": r.get("desc", "")}
-                    for r in pinecone_results
-                ],
+                # "pinecone_results": candidatos_pinecone,   # <-- ELIMINADO
+                "candidatos_pinecone": candidatos_pinecone,
                 "candidatos_gpt": candidatos_gpt,
+                "timestamp": datetime.utcnow().isoformat(),
                 "tokens_entrada": tokens_entrada,
                 "tokens_salida": tokens_salida,
-                "ip_cliente": ip_cliente,
-                "timestamp": datetime.utcnow().isoformat()
+                "ip_cliente": ip_cliente
             }
         )
 
@@ -224,10 +226,8 @@ def lambda_handler(event, context):
             "statusCode": 200,
             "body": json.dumps({
                 "candidatos_gpt": candidatos_gpt,
-                "sessionId": sessionId,
-                "tokens_entrada": tokens_entrada,
-                "tokens_salida": tokens_salida,
-                "ip_cliente": ip_cliente
+                "candidatos_pinecone": candidatos_pinecone,
+                "sessionId": sessionId
             })
         }
     except Exception as e:
