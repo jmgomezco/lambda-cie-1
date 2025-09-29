@@ -45,26 +45,21 @@ def search_pinecone(query_text, secrets):
         index_name = "cie2024"
         pc = Pinecone(api_key=secrets["PINECONE_API_KEY"])
         index = pc.Index(index_name)
-
         # Convertir el texto a mayúsculas antes de obtener el embedding
         embedding = get_openai_embedding(query_text, secrets)
-
         pinecone_response = index.query(
             vector=embedding,
             top_k=MAX_PINECONE_RESULTS,
             include_metadata=True
         )
-
         candidates = []
         for match in pinecone_response.matches:
             codigo = str(match.id)
             desc = str(match.metadata.get("desc", ""))
             candidates.append({"codigo": codigo, "desc": desc})
-
         return candidates
     except Exception as e:
         raise
-
 
 def get_cie10_descriptions(codes):
     """
@@ -125,23 +120,16 @@ def lambda_handler(event, context):
             sessionId = str(uuid.uuid4())
 
         trimmed_texto = texto[:150]
+        trimmed_texto = trimmed_texto[:1].upper() + trimmed_texto[1:] if trimmed_texto else ""
 
         pinecone_results = search_pinecone(trimmed_texto, secrets)
         pinecone_results = pinecone_results[:MAX_PINECONE_RESULTS]
 
+        # Corrige variable mal nombrada: candidatos_pencone -> pinecone_results
         candidatos_pinecone = [
             {"codigo": r.get("codigo", ""), "desc": r.get("desc", "")}
             for r in pinecone_results
         ]
-
-        # ... (resto del código sin cambios previos)
-
-        # Llamada a GPT-3.5 Turbo para seleccionar SOLO CÓDIGOS (no objetos)
-        gpt_api_url = "https://api.openai.com/v1/chat/completions"
-        gpt_headers = {
-            "Authorization": f"Bearer {secrets['OPENAI_API_KEY']}",
-            "Content-Type": "application/json"
-        }
 
         pinecone_json = json.dumps([
             {"codigo": str(r.get("codigo", "")), "desc": str(r.get("desc", ""))}
@@ -149,24 +137,31 @@ def lambda_handler(event, context):
         ], ensure_ascii=False)
         valid_codes = set(str(r.get("codigo", "")) for r in pinecone_results)
 
-        reglas_json = json.dumps({
-            "instrucciones": [
-                "No generes respuesta si la frase no es coherente en un entorno cínico",
-                "Selecciona 8 códigos con mayor relevancia, solo escoge códigos de la lista de candidatos que se te ofrece",
-                "En códigos con lateralidad, si el texto no lo indica, elige lateralidad derecha",
-                "En códigos  de fractura, si el texto no lo indica, elige primero  fracturas cerradas sobre abiertas.", 
-                "Responde solo un array JSON con los 8 códigos más relevantes, solo array de strings."
-            ]
-        }, ensure_ascii=False)
 
+        reglas_json = json.dumps({
+        "instrucciones": [
+        "Selecciona hasta 8 códigos CIE-10 con mayor relevancia, solo escoge códigos de la lista de candidatos que se te ofrece.",
+        "En códigos de traumatismos, envenenamientos, etc. (capítulo 19 de la CIE-10), selecciona primero códigos de 'contacto inicial'.",
+        "En códigos de fracturas, elige primero fractura cerrada.",
+        "Si el texto NO contiene ningún término clínico, NO generes ningún código y responde con un array vacío: [].",
+        "NO ofrezcas códigos si el texto es absurdo, no tiene sentido clínico o es una conversación casual.",
+        "Responde solo un array JSON con los códigos relevantes (máximo 8), solo array de strings, sin explicaciones."
+        ]
+        }, ensure_ascii=False)
+        
         # CAMBIO: Enviamos el texto trimado (sin normalizar) a GPT
         messages = [
             {"role": "system", "content": "Eres un asistente experto en codificación CIE-10."},
             {"role": "user", "content": f"Texto: {trimmed_texto}\nCandidatos: {pinecone_json}\nReglas: {reglas_json}\nResponde solo un array JSON con los 8 códigos más relevantes."}
         ]
 
+        gpt_api_url = "https://api.openai.com/v1/chat/completions"
+        gpt_headers = {
+            "Authorization": f"Bearer {secrets['OPENAI_API_KEY']}",
+            "Content-Type": "application/json"
+        }
         gpt_data = {
-            "model": "gpt-3.5-turbo",  # <-- CAMBIO PRINCIPAL AQUÍ
+            "model": "gpt-4o-mini",
             "messages": messages,
             "max_tokens": 200,
             "temperature": 0.2
@@ -212,7 +207,6 @@ def lambda_handler(event, context):
             Item={
                 "sessionId": sessionId,
                 "texto": trimmed_texto,  # texto literal del usuario, recortado a 200 caracteres
-                # "pinecone_results": candidatos_pinecone,   # <-- ELIMINADO
                 "candidatos_pinecone": candidatos_pinecone,
                 "candidatos_gpt": candidatos_gpt,
                 "timestamp": datetime.utcnow().isoformat(),
